@@ -1,0 +1,156 @@
+name: KiCAD Resource Generator
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**.kicad_sch'
+      - '**.kicad_pcb'
+      
+concurrency:
+  group: ${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  gen-resources:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      # 1) Check out the repository so we can modify files
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+            fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      # 2) Set up Docker.
+      - name: Set up Docker
+        run: |
+          docker build -f .github/workflows/rscgen-Dockerfile -t kicad-render .
+  
+      # 3) Set up directory permissions.
+      - name: Set directory permissions
+        run: |
+          echo "Setting directory permissions to 777..."
+          sudo chmod -R 777 .
+  
+      # 4) Export schematic, PCB, and 3D model.
+      - name: Export schematic, PCB, and 3D model
+        run: |
+          # Check pull request changes and push changes.
+          if ${{ github.event_name == 'pull_request' }}; then
+            changed_files=( $(git diff --name-only -r HEAD^1 HEAD | xargs) )
+          else
+            changed_files=( $(git diff --name-only ${{ github.event.before }} ${{ github.event.after }} | xargs) )
+          fi
+
+          # Iterate over the files and add projects to a list. 
+          # This workflow only runs when there are changes to kicad_sch and kicad_pcb files, however this runs over all files. 
+          # Declare list of hardware projects.
+          declare -a hardware_projects
+
+          # Interate over list of files.
+          for file in "${changed_files[@]}"; do
+            echo "$file was changed"
+
+            # If changed file is a kicad schematic or pcb file
+            if [[ $file == *.kicad_sch ]] || [[ $file == *.kicad_pcb ]]; then
+              echo "$file is a hardware file"
+
+              # Trim the tail end leaving just the path to the root of the hardware project.
+              tmp="${file%"kicad/"*}"
+
+              # Check if the path has already been added to the list of hardware projects
+              exists=0
+              for path in "${hardware_projects[@]}"; do
+                if [[ $path == $tmp ]]; then
+                  exists=1
+                fi
+              done
+
+              # If not yet added, add file to list of projects.
+              if ! (( exists )); then
+                echo "Adding project $tmp" 
+              hardware_projects+=( "$tmp" )
+              fi
+            fi
+          done
+
+          # Go through hardware projects
+          for hardware_project in "${hardware_projects[@]}"; do
+            # Check if KiCAD Directory exists.
+            echo $hardware_project
+            if [ -d $hardware_project/kicad ]; then
+              echo "Found kicad Directory! Exporting schematic, PCB, and 3D model..."
+              docker run --rm -v "${{ github.workspace }}/$hardware_project:/$hardware_project" -w /$hardware_project kicad-render bash -c "
+                # Export KiCAD 8 and 9 model dirs
+                export KICAD8_3DMODEL_DIR=/usr/share/kicad/3dmodels
+                export KICAD9_3DMODEL_DIR=/usr/share/kicad/3dmodels
+
+                # Clean output directors if needed.
+                rm -rf gen
+
+                # Make file structure
+                mkdir -p gen
+                mkdir -p gen/3d
+                mkdir -p gen/images
+                mkdir -p gen/images/tmp
+
+                # Loop through schematic files.
+                cd kicad/
+                for filename in *.kicad_sch
+                do
+                  # Generate image export of that file.
+                  filename=\${filename%.*}
+                  echo Processing schematic: \$filename
+                  kicad-cli sch export svg -o ../gen/images/tmp \${filename}.kicad_sch
+                  mv ../gen/images/tmp/\${filename}.svg ../gen/images/\${filename}_sch.svg
+                done
+                cd ../
+                rm -rf gen/images/tmp
+          
+                # Export PCB front
+                kicad-cli pcb export svg kicad/*.kicad_pcb --mode-single -o 'gen/images/pcb_front.svg' --page-size-mode 2 --exclude-drawing-sheet --layers 'F.Cu,F.SilkS,F.Mask,Edge.Cuts' 
+                kicad-cli pcb render kicad/*.kicad_pcb --output 'gen/images/board.front.png' -w 2048 -h 2048 --side top --quality high --light-side .65 --light-side-elevation 45 --light-camera 0
+                
+                # Export PCB back
+                kicad-cli pcb export svg kicad/*.kicad_pcb --mode-single -o 'gen/images/pcb_back.svg' --page-size-mode 2 -m --exclude-drawing-sheet --layers 'B.Cu,B.SilkS,B.Mask,Edge.Cuts'
+                kicad-cli pcb render kicad/*.kicad_pcb --output 'gen/images/board.back.png' -w 2048 -h 2048 --side bottom --quality high --light-side .65 --light-side-elevation 45 --light-camera 0
+      
+                # Cropping
+                sed -i 's/fill="white"/fill="none"/g' gen/images/pcb_front.svg
+                sed -i 's/fill="white"/fill="none"/g' gen/images/pcb_back.svg
+                inkscape --export-area-drawing --export-filename=gen/images/pcb_front.svg gen/images/pcb_front.svg
+                inkscape --export-area-drawing --export-filename=gen/images/pcb_back.svg gen/images/pcb_back.svg
+      
+                # Export 3D model (tolerate warnings, check output)
+                kicad-cli pcb export step kicad/*.kicad_pcb --output 'gen/3d/pcb_model.step' || echo \"Warning: STEP export encountered issues, checking output...\"
+                if [ -f gen/3d/pcb_model.step ]; then
+                  echo \"STEP file created successfully.\"
+                else
+                  echo \"Error: STEP file not created.\"
+                fi
+              "
+              else
+                echo Did not find kicad Directory!
+              fi
+          done;
+
+      # 5) Configure Git user/email
+      - name: Configure Git
+        run: |
+          git config user.name "Kicad Export Generator"
+          git config user.email "KiCADGenetator[bot]@users.noreply.github.com"
+
+      # 6) Commit and push changes to main using the GitHub App token
+      - name: Commit gen files with app token
+        run: |
+          git add **/gen/*
+          git commit -m "Update autogen files" || echo "No changes to commit."
+          git remote set-url origin "https://x-access-token:${{ steps.create_app_token.outputs.token }}@github.com/${{ github.repository }}.git"
+          git push origin master
+
+      # 7) Notify completion
+      - name: Notify completion
+        run: echo "Updates gen/images and pushed changes to the repository."
